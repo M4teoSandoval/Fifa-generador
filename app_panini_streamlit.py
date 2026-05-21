@@ -13,10 +13,11 @@ Dependencias (requirements.txt):
 import streamlit as st
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
 import io
 import os
 import gdown
+import math
 
 # ─── Configuración de página ────────────────────────────────────────────────
 st.set_page_config(
@@ -32,10 +33,6 @@ MODEL_PATH   = "generador_fifa_ccd.keras"
 
 # URL pública del modelo en Google Drive o GitHub Releases.
 # ⚠️  AJUSTA ESTA URL con el enlace real de tu modelo subido.
-# Ejemplo Google Drive (enlace de descarga directa):
-#   https://drive.google.com/uc?id=TU_FILE_ID
-# Ejemplo GitHub Releases:
-#   https://github.com/tu-usuario/tu-repo/releases/download/v1.0/generador_fifa_ccd.keras
 MODEL_URL = "https://drive.google.com/uc?id=REEMPLAZA_CON_TU_FILE_ID"
 
 # ─── Carga del modelo (con caché) ───────────────────────────────────────────
@@ -58,148 +55,294 @@ def generar_imagen(modelo, semilla: int) -> Image.Image:
     img_uint8 = (img_np * 255).astype(np.uint8)
     return Image.fromarray(img_uint8)
 
+
+# ─── Helpers de dibujo ──────────────────────────────────────────────────────
+
+def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
+    """Carga fuente TrueType con fallback al default de Pillow."""
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+BOLD   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+def _center_x(draw, text, font, card_w, x_offset=0):
+    """Devuelve la coordenada x para centrar texto horizontalmente."""
+    bb = draw.textbbox((0, 0), text, font=font)
+    return (card_w - (bb[2] - bb[0])) // 2 + x_offset
+
+def _text_w(draw, text, font):
+    bb = draw.textbbox((0, 0), text, font=font)
+    return bb[2] - bb[0]
+
+def _text_h(draw, text, font):
+    bb = draw.textbbox((0, 0), text, font=font)
+    return bb[3] - bb[1]
+
+def _draw_circle_flag(draw, cx, cy, r, color_main, color_secondary=(255,255,255)):
+    """Dibuja un símbolo de bandera circular simple (círculo bicolor)."""
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                 fill=color_secondary, outline=(30, 30, 30), width=2)
+    draw.ellipse([cx - r + 4, cy - r + 4, cx + r - 4, cy + r - 4],
+                 fill=color_main)
+
+def _draw_trophy(draw, x, y, size, color=(255, 255, 255)):
+    """Dibuja un trofeo FIFA simplificado con líneas."""
+    s = size
+    # Copa
+    pts_cup = [
+        x, y,
+        x + s, y,
+        x + s * 0.85, y + s * 0.6,
+        x + s * 0.55, y + s * 0.75,
+        x + s * 0.55, y + s * 0.9,
+        x + s * 0.7, y + s * 0.9,
+        x + s * 0.7, y + s,
+        x + s * 0.3, y + s,
+        x + s * 0.3, y + s * 0.9,
+        x + s * 0.45, y + s * 0.9,
+        x + s * 0.45, y + s * 0.75,
+        x + s * 0.15, y + s * 0.6,
+    ]
+    draw.polygon(pts_cup, fill=color)
+    # Asas izquierda
+    draw.arc([x - s * 0.15, y + s * 0.05, x + s * 0.25, y + s * 0.5],
+             start=180, end=360, fill=color, width=max(2, s // 10))
+    # Asas derecha
+    draw.arc([x + s * 0.75, y + s * 0.05, x + s * 1.15, y + s * 0.5],
+             start=0, end=180, fill=color, width=max(2, s // 10))
+
+
 # ─── Construcción de la tarjeta Panini ──────────────────────────────────────
+
 def generar_tarjeta_panini(
     foto_pil: Image.Image,
     nombre_jugador: str = "TU NOMBRE",
     fecha_nacimiento: str = "DD-MM-YYYY",
-    altura: str = "1,75m",
-    peso: str = "70 kg",
-    club: str = "UNAB FC",
-    pais_abrev: str = "COL",
-    color_pais: str = "green",
+    altura: str = "1,76 m",
+    peso: str = "73 kg",
+    club: str = "REAL MADRID CF (ESP)",
+    pais_abrev: str = "BRA",
+    color_fondo: tuple = (0, 200, 210),      # turquesa FIFA
+    color_acento: tuple = (0, 160, 80),      # verde bandera
     card_w: int = 420,
     card_h: int = 560,
 ) -> Image.Image:
-    """Genera una tarjeta coleccionable estilo Panini FIFA World Cup 2026."""
+    """
+    Genera una tarjeta coleccionable lo más fiel posible al diseño
+    oficial Panini FIFA World Cup 2026.
 
-    # Paleta oficial FIFA
-    CELESTE  = (0,   200, 215)
-    VERDE    = (0,   166,  81)
-    ROJO     = (232,  49,  42)
-    AMARILLO = (255, 215,   0)
-    BLANCO   = (255, 255, 255)
-    GRIS_OSC = ( 40,  40,  40)
-    AZUL_OSC = ( 15,  30,  80)
+    Estructura visual (de arriba a abajo):
+      1. Fondo turquesa sólido
+      2. Números "26" grandes semitransparentes (izq verde / der blanco)
+      3. Logo FIFA + trofeo (esquina sup. der.)
+      4. Foto del jugador (ocupa casi toda la carta)
+      5. Franja lateral derecha: bandera + letras del país
+      6. Panel inferior blanco: nombre / datos / club / PANINI
+    """
+
+    # ── Paleta ──────────────────────────────────────────────────────────────
+    BLANCO  = (255, 255, 255)
+    NEGRO   = (10,  10,  10)
+    AMARILLO= (255, 210,   0)
+    GRIS    = (80,  80,  80)
 
     COLORES_PAIS = {
-        "green":  VERDE,
-        "red":    ROJO,
-        "blue":   (30,  80, 160),
+        "green":  (0,  160,  80),
+        "red":    (210,  30,  30),
+        "blue":   (30,  80, 180),
         "yellow": (200, 160,   0),
         "orange": (220, 100,  20),
+        "white":  (200, 200, 200),
     }
-    color_acento = COLORES_PAIS.get(color_pais, VERDE)
 
-    # Lienzo base
-    card = Image.new("RGB", (card_w, card_h), CELESTE)
-    draw = ImageDraw.Draw(card)
+    # ── Lienzo base (fondo turquesa) ─────────────────────────────────────────
+    card = Image.new("RGBA", (card_w, card_h), (*color_fondo, 255))
+    draw = ImageDraw.Draw(card, "RGBA")
 
-    # Borde arco-iris FIFA
-    border_colors = [ROJO, AMARILLO, VERDE, (100, 50, 200), CELESTE]
-    for i, bc in enumerate(border_colors):
-        b = i * 3
-        draw.rectangle([b, b, card_w - b - 1, card_h - b - 1], outline=bc, width=3)
+    # ── Fuentes ──────────────────────────────────────────────────────────────
+    f_num   = _font(BOLD,    220)   # dígitos "2" y "6"
+    f_fifa  = _font(BOLD,     18)   # "FIFA"
+    f_wc    = _font(REGULAR,  11)   # "WORLD CUP"
+    f_year  = _font(BOLD,     16)   # "2026"
+    f_name  = _font(BOLD,     26)   # nombre jugador
+    f_data  = _font(REGULAR,  15)   # datos biométricos
+    f_club  = _font(BOLD,     16)   # club
+    f_panini= _font(BOLD,     15)   # logo PANINI
+    f_pais  = _font(BOLD,     20)   # letras país vertical
+    f_ccd   = _font(REGULAR,  11)   # marca CCD·UNAB
+    f_num_sm= _font(BOLD,     14)   # "26" en bloque derecho
 
-    # Fondo con degradado simulado (franjas horizontales)
-    for y in range(card_h):
-        t = y / card_h
-        r   = int(CELESTE[0] * (1 - t) + (CELESTE[0] - 30) * t)
-        g   = int(CELESTE[1] * (1 - t) + (CELESTE[1] - 20) * t)
-        b_c = int(CELESTE[2] * (1 - t) + (CELESTE[2] + 10) * t)
-        draw.line([(15, y), (card_w - 15, y)], fill=(r, g, b_c))
+    # ── 1. Números decorativos "2 6" grandes ────────────────────────────────
+    # "2" verde izquierda  (muy transparente, sólo textura)
+    overlay_num = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
+    dn = ImageDraw.Draw(overlay_num, "RGBA")
 
-    # Cargar fuentes
-    try:
-        font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 180)
-        font_med = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-        font_sm  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-        font_xs  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",      16)
-        font_nm  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-    except Exception:
-        font_big = font_med = font_sm = font_xs = font_nm = ImageFont.load_default()
+    # "2" verde grande (izquierda) — igual al original
+    dn.text((-30, -10), "2", font=f_num, fill=(*color_acento, 160))
+    # "6" verde grande (izquierda, desplazado abajo)
+    dn.text((50, 110), "6", font=f_num, fill=(*color_acento, 160))
 
-    # Números decorativos "26" (fondo)
-    draw.text((10, 50), "2",  font=font_big, fill=(*VERDE,  120))
-    draw.text((85, 110), "6", font=font_big, fill=(*ROJO,   100))
-    draw.text((card_w - 130, 50),  "2", font=font_big, fill=(*BLANCO, 80))
-    draw.text((card_w - 70,  110), "6", font=font_big, fill=(*BLANCO, 70))
+    # "2" blanco derecha (más arriba)
+    dn.text((card_w - 185, -10), "2", font=f_num, fill=(255, 255, 255, 60))
+    # "6" blanco derecha
+    dn.text((card_w - 120, 110), "6", font=f_num, fill=(255, 255, 255, 55))
 
-    # Logo FIFA World Cup 2026
-    draw.text((20, 20),      "FIFA",      font=font_sm, fill=BLANCO)
-    draw.text((20, 46),      "WORLD CUP", font=font_xs, fill=BLANCO)
-    draw.text((20, 64),      "2026",      font=font_sm, fill=AMARILLO)
+    card = Image.alpha_composite(card, overlay_num)
+    draw = ImageDraw.Draw(card, "RGBA")
 
-    # Foto del jugador generada por GAN
-    foto_w, foto_h = 260, 290
-    foto_x = (card_w - foto_w) // 2
-    foto_y = 60
+    # ── 2. Logo FIFA + trofeo (esquina superior derecha) ────────────────────
+    logo_x = card_w - 105
+    logo_y = 10
+
+    # Trofeo FIFA
+    _draw_trophy(draw, logo_x + 10, logo_y + 2, 38, color=BLANCO)
+
+    # Texto "FIFA"
+    draw.text((logo_x + 3, logo_y + 45), "FIFA",
+              font=f_fifa, fill=BLANCO)
+    draw.text((logo_x, logo_y + 64), "WORLD CUP",
+              font=f_wc, fill=BLANCO)
+    draw.text((logo_x + 8, logo_y + 77), "2026",
+              font=f_year, fill=AMARILLO)
+
+    # ── 3. Foto del jugador ──────────────────────────────────────────────────
+    # La foto ocupa prácticamente toda la carta excepto el panel inferior
+    panel_h   = 118    # altura del panel inferior blanco
+    franja_w  = 55     # ancho de la franja lateral derecha
+    foto_w    = card_w - franja_w
+    foto_h    = card_h - panel_h
+    foto_x    = 0
+    foto_y    = 0
 
     img_jugador = foto_pil.convert("RGB")
-    # Si es 64x64 (GAN), hacer upscale con calidad
+
     if img_jugador.width <= 64:
+        # Imagen GAN 64×64 → upscale con nearest para estilo pixel art nítido
         img_jugador = img_jugador.resize((foto_w, foto_h), Image.NEAREST)
     else:
+        # Foto real: crop cuadrado centrado, luego resize
         w_j, h_j = img_jugador.size
-        lado_j = min(w_j, h_j)
-        img_jugador = img_jugador.crop(((w_j - lado_j) // 2, (h_j - lado_j) // 2,
-                                         (w_j + lado_j) // 2, (h_j + lado_j) // 2))
+        # Mantener más de la parte superior (cara) → crop desde arriba
+        lado = min(w_j, h_j)
+        top  = 0
+        left = (w_j - lado) // 2
+        img_jugador = img_jugador.crop((left, top, left + lado, top + lado))
         img_jugador = img_jugador.resize((foto_w, foto_h), Image.LANCZOS)
 
-    img_jugador = ImageEnhance.Color(img_jugador).enhance(1.3)
+    # Realce de color y brillo
+    img_jugador = ImageEnhance.Color(img_jugador).enhance(1.25)
     img_jugador = ImageEnhance.Brightness(img_jugador).enhance(1.05)
-    card.paste(img_jugador, (foto_x, foto_y))
-    draw.rectangle([foto_x - 2, foto_y - 2, foto_x + foto_w + 2, foto_y + foto_h + 2],
-                   outline=BLANCO, width=3)
+    img_jugador = ImageEnhance.Contrast(img_jugador).enhance(1.1)
 
-    # Banda de país (derecha)
-    banda_x = card_w - 60
-    draw.rectangle([banda_x, foto_y, card_w - 18, foto_y + foto_h], fill=color_acento)
-    flag_cx = banda_x + 21
-    flag_cy = foto_y + 50
-    draw.ellipse([flag_cx - 20, flag_cy - 20, flag_cx + 20, flag_cy + 20],
-                 fill=BLANCO, outline=GRIS_OSC, width=2)
-    draw.ellipse([flag_cx - 13, flag_cy - 13, flag_cx + 13, flag_cy + 13],
-                 fill=color_acento)
-    for i, letra in enumerate(pais_abrev[:3]):
-        draw.text((banda_x + 8, foto_y + 90 + i * 28), letra, font=font_sm, fill=BLANCO)
+    card.paste(img_jugador.convert("RGBA"), (foto_x, foto_y))
+    draw = ImageDraw.Draw(card, "RGBA")
 
-    # Panel nombre
-    info_y = foto_y + foto_h + 15
-    draw.rectangle([18, info_y, card_w - 18, info_y + 48], fill=(*AZUL_OSC, 220))
-    draw.rectangle([18, info_y, card_w - 18, info_y + 48], outline=color_acento, width=2)
-    bbox_nm = draw.textbbox((0, 0), nombre_jugador.upper(), font=font_med)
-    nm_w = bbox_nm[2] - bbox_nm[0]
-    draw.text(((card_w - nm_w) // 2, info_y + 6), nombre_jugador.upper(),
-              font=font_med, fill=BLANCO)
+    # ── 4. Franja lateral derecha ────────────────────────────────────────────
+    fx = card_w - franja_w
+    fy = 0
+    fh = card_h - panel_h
 
-    # Panel datos biométricos
-    datos_y = info_y + 55
-    draw.rectangle([18, datos_y, card_w - 18, datos_y + 32], fill=(20, 20, 60))
+    draw.rectangle([fx, fy, card_w, fh], fill=(*color_acento, 245))
+
+    # Bandera circular centrada en la franja, un tercio desde arriba
+    flag_cx = fx + franja_w // 2
+    flag_cy = fy + fh // 3
+    flag_r  = 20
+
+    # Círculo exterior blanco + interior del color del país
+    draw.ellipse(
+        [flag_cx - flag_r, flag_cy - flag_r,
+         flag_cx + flag_r, flag_cy + flag_r],
+        fill=BLANCO, outline=(20, 20, 20), width=2
+    )
+    draw.ellipse(
+        [flag_cx - flag_r + 5, flag_cy - flag_r + 5,
+         flag_cx + flag_r - 5, flag_cy + flag_r - 5],
+        fill=color_acento
+    )
+    # Cruz/estrella interior blanca
+    draw.ellipse(
+        [flag_cx - 5, flag_cy - 5, flag_cx + 5, flag_cy + 5],
+        fill=BLANCO
+    )
+
+    # Letras del país verticales (debajo de la bandera)
+    letters_start_y = flag_cy + flag_r + 18
+    for i, letra in enumerate(pais_abrev.upper()[:3]):
+        lw = _text_w(draw, letra, f_pais)
+        draw.text(
+            (fx + (franja_w - lw) // 2, letters_start_y + i * 30),
+            letra, font=f_pais, fill=BLANCO
+        )
+
+    # Números "26" en blanco pequeños al fondo de la franja
+    draw.text((fx + 8, fh - 80), "2", font=_font(BOLD, 55),
+              fill=(255, 255, 255, 80))
+    draw.text((fx + 8, fh - 45), "6", font=_font(BOLD, 55),
+              fill=(255, 255, 255, 70))
+
+    # ── 5. Panel inferior blanco ─────────────────────────────────────────────
+    panel_y = card_h - panel_h
+    draw.rectangle([0, panel_y, card_w, card_h], fill=(*BLANCO, 255))
+
+    # Línea separadora superior del panel
+    draw.line([(0, panel_y), (card_w, panel_y)], fill=(200, 200, 200), width=1)
+
+    # — Nombre del jugador —
+    nombre_upper = nombre_jugador.upper()
+    draw.text(
+        (_center_x(draw, nombre_upper, f_name, card_w), panel_y + 10),
+        nombre_upper, font=f_name, fill=NEGRO
+    )
+
+    # — Datos biométricos —
     datos_str = f"{fecha_nacimiento}  |  {altura}  |  {peso}"
-    bbox_d = draw.textbbox((0, 0), datos_str, font=font_xs)
-    d_w = bbox_d[2] - bbox_d[0]
-    draw.text(((card_w - d_w) // 2, datos_y + 8), datos_str,
-              font=font_xs, fill=(180, 180, 220))
+    draw.text(
+        (_center_x(draw, datos_str, f_data, card_w), panel_y + 44),
+        datos_str, font=f_data, fill=GRIS
+    )
 
-    # Panel club
-    club_y = datos_y + 40
-    draw.rectangle([18, club_y, card_w - 18, club_y + 32], fill=(10, 10, 40))
-    draw.rectangle([18, club_y, card_w - 18, club_y + 32], outline=AMARILLO, width=1)
-    bbox_c = draw.textbbox((0, 0), club.upper(), font=font_nm)
-    c_w = bbox_c[2] - bbox_c[0]
-    draw.text(((card_w - c_w) // 2, club_y + 6), club.upper(), font=font_nm, fill=AMARILLO)
+    # — Separador horizontal delgado —
+    sep_y = panel_y + 66
+    draw.line([(12, sep_y), (card_w - 12, sep_y)], fill=(210, 210, 210), width=1)
 
-    # Logo PANINI
-    panini_y = club_y + 42
-    draw.rectangle([card_w - 130, panini_y, card_w - 18, panini_y + 30], fill=AMARILLO)
-    draw.text((card_w - 123, panini_y + 5), "PANINI", font=font_sm, fill=GRIS_OSC)
+    # — Fila de club + logo PANINI —
+    club_y = sep_y + 8
 
-    # Marca CCD·UNAB
-    draw.text((20, card_h - 30), "✦ DCGAN  CCD·UNAB",
-              font=font_xs, fill=(200, 240, 255))
+    # Franja celeste de fondo para el club (igual al original)
+    draw.rectangle([0, club_y - 2, card_w, club_y + 32],
+                   fill=(*color_fondo, 30))
 
-    return card
+    # Nombre del club
+    club_upper = club.upper()
+    draw.text((16, club_y + 4), club_upper, font=f_club, fill=NEGRO)
+
+    # Logo PANINI (caja amarilla con texto, a la derecha)
+    panini_label = "PANINI"
+    pw = _text_w(draw, panini_label, f_panini)
+    px1 = card_w - pw - 28
+    px2 = card_w - 8
+    py1 = club_y
+    py2 = club_y + 28
+
+    draw.rounded_rectangle([px1 - 6, py1, px2, py2],
+                            radius=4, fill=AMARILLO)
+    draw.text((px1, py1 + 5), panini_label, font=f_panini, fill=NEGRO)
+
+    # ── 6. Borde exterior mínimo ─────────────────────────────────────────────
+    draw_border = ImageDraw.Draw(card)
+    draw_border.rectangle([0, 0, card_w - 1, card_h - 1],
+                           outline=(180, 180, 180), width=1)
+
+    # ── 7. Marca CCD·UNAB (discreta) ────────────────────────────────────────
+    marca = "✦ DCGAN  CCD·UNAB"
+    draw.text((8, card_h - 14), marca, font=f_ccd,
+              fill=(180, 230, 240, 200))
+
+    return card.convert("RGB")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -227,22 +370,35 @@ except Exception as e:
 # ── Columnas: configuración | previsualización ───────────────────────────────
 col_config, col_preview = st.columns([1, 1], gap="large")
 
+# Mapa de colores de países
+COLORES_MAP = {
+    "green":  ((0,  160,  80),  (0, 200, 210)),   # (acento, fondo)
+    "red":    ((210,  30,  30), (0, 200, 210)),
+    "blue":   ((30,  80, 180),  (0, 200, 210)),
+    "yellow": ((200, 160,   0), (0, 200, 210)),
+    "orange": ((220, 100,  20), (0, 200, 210)),
+}
+
 with col_config:
     st.subheader("🎮 Tu tarjeta")
 
     nombre    = st.text_input("Nombre completo", value="TU NOMBRE")
     fecha_nac = st.text_input("Fecha de nacimiento (DD-MM-YYYY)", value="01-01-2000")
-    altura    = st.text_input("Altura", value="1,75m")
+    altura    = st.text_input("Altura", value="1,75 m")
     peso      = st.text_input("Peso", value="70 kg")
     club      = st.text_input("Club / Universidad", value="UNAB FC (COL)")
     pais      = st.text_input("País (3 letras)", value="COL", max_chars=3)
 
     color_pais = st.selectbox(
         "Color acento del país",
-        options=["green", "red", "blue", "yellow", "orange"],
-        format_func=lambda x: {"green": "🟢 Verde", "red": "🔴 Rojo",
-                                "blue": "🔵 Azul", "yellow": "🟡 Amarillo",
-                                "orange": "🟠 Naranja"}[x]
+        options=list(COLORES_MAP.keys()),
+        format_func=lambda x: {
+            "green":  "🟢 Verde",
+            "red":    "🔴 Rojo",
+            "blue":   "🔵 Azul",
+            "yellow": "🟡 Amarillo",
+            "orange": "🟠 Naranja",
+        }[x]
     )
 
     st.markdown("---")
@@ -261,6 +417,8 @@ with col_config:
 with col_preview:
     st.subheader("📋 Vista previa")
 
+    acento, fondo = COLORES_MAP[color_pais]
+
     if generar_btn or True:  # mostrar preview en tiempo real
         with st.spinner("Generando tarjeta…"):
             tarjeta = generar_tarjeta_panini(
@@ -271,15 +429,14 @@ with col_preview:
                 peso             = peso,
                 club             = club,
                 pais_abrev       = pais.upper(),
-                color_pais       = color_pais,
+                color_fondo      = fondo,
+                color_acento     = acento,
             )
 
-        # Mostrar tarjeta en la app
         st.image(tarjeta, use_column_width=True)
 
-        # Botón de descarga
+        # Botón de descarga (300 DPI, ×3)
         buf = io.BytesIO()
-        # Alta resolución x3
         tarjeta_hd = tarjeta.resize(
             (tarjeta.width * 3, tarjeta.height * 3), Image.LANCZOS
         )
